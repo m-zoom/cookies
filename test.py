@@ -1308,7 +1308,6 @@ def _build_chromium_ua(version, browser_name):
 
 def collect_system_fingerprint():
     """Collect machine-level fingerprint — same regardless of which browser."""
-    geo = _fetch_ip_geolocation()
     return {
         "screen": _get_screen_resolution(),
         "timezone": _get_iana_timezone(),
@@ -1319,91 +1318,16 @@ def collect_system_fingerprint():
         "device_memory": _get_device_memory(),
         "platform": _get_platform_str(),
         "os_version": _get_os_version(),
-        # Real geolocation from the target machine's public IP — so the
-        # backend can set navigator.geolocation to match where the user
-        # actually is, reducing location-mismatch security checks.
-        "geo_ip": geo.get("ip", ""),
-        "geo_city": geo.get("city", ""),
-        "geo_region": geo.get("region", ""),
-        "geo_country": geo.get("country", ""),
-        "geo_latitude": geo.get("latitude", None),
-        "geo_longitude": geo.get("longitude", None),
     }
 
 def collect_browser_fingerprint(user_data_path, browser_name):
-    """Collect browser-specific fingerprint: real User-Agent + Preferences."""
+    """Collect browser-specific fingerprint (mainly the real User-Agent)."""
     version = _get_browser_version(user_data_path)
     ua = _build_chromium_ua(version, browser_name) if version else ""
-    prefs = _extract_preferences(user_data_path)
     return {
         "user_agent": ua,
         "version": version,
-        # The browser's own accept_languages from Preferences (more accurate
-        # than the OS locale). Sites check the Accept-Language header against
-        # the IP's expected language — a mismatch is a red flag.
-        "accept_language": prefs.get("accept_languages", ""),
     }
-
-
-# ---------------------------------------------------------------------------
-# IP geolocation — query the target machine's public IP and location
-# ---------------------------------------------------------------------------
-def _fetch_ip_geolocation(timeout=5):
-    """Fetch the target machine's public IP + geolocation from ipinfo.io.
-
-    This is called FROM the user's PC, so the IP returned is the user's real
-    public IP — the one sites see when the user browses normally. We record
-    city/region/country/lat/lon so the backend can set matching Playwright
-    geolocation and detect when a proxy is needed.
-    """
-    try:
-        resp = requests.get("https://ipinfo.io/json", timeout=timeout)
-        if resp.status_code != 200:
-            return {}
-        data = resp.json()
-        loc = (data.get("loc") or "").split(",")
-        return {
-            "ip": data.get("ip", ""),
-            "city": data.get("city", ""),
-            "region": data.get("region", ""),
-            "country": data.get("country", ""),
-            "latitude": float(loc[0]) if len(loc) >= 2 and loc[0] else None,
-            "longitude": float(loc[1]) if len(loc) >= 2 and loc[1] else None,
-        }
-    except Exception:
-        return {}
-
-
-# ---------------------------------------------------------------------------
-# Browser Preferences extraction — accept-language, fonts, site settings
-# ---------------------------------------------------------------------------
-def _extract_preferences(user_data_path):
-    """Extract relevant signals from Chromium's Preferences JSON file.
-
-    The Preferences file (in the User Data root) is a JSON blob that persists
-    across browser restarts. We pull the signals that sites use to recognize a
-    returning device:
-      - intl.accept_languages  → the exact Accept-Language header the browser sends
-      - webkit.webprefs.fonts  → font preferences (a fingerprinting vector)
-    """
-    prefs_path = os.path.join(user_data_path, "Preferences")
-    if not os.path.isfile(prefs_path):
-        return {}
-    try:
-        with open(prefs_path, "r", encoding="utf-8") as f:
-            prefs = json.load(f)
-    except Exception:
-        return {}
-
-    result = {}
-    # Accept-Language — this is the EXACT string sent in the header.
-    # It often differs from the OS locale (e.g. "en-NG,en-US;q=0.9,en;q=0.8").
-    intl = prefs.get("intl", {})
-    al = intl.get("accept_languages", "")
-    if al:
-        result["accept_languages"] = al
-
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1516,9 +1440,6 @@ def main(args):
     emit("")
     emit("Collecting browser fingerprint...")
     machine_fp = collect_system_fingerprint()
-    if machine_fp.get("geo_country"):
-        emit(f"  Location: {machine_fp['geo_city']}, {machine_fp['geo_region']}, "
-             f"{machine_fp['geo_country']} (IP: {machine_fp['geo_ip']})")
     browser_fps = {}
     for b in chromium:
         fp = collect_browser_fingerprint(b["user_data"], b["name"])
