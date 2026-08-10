@@ -1443,7 +1443,27 @@ def extract_indexeddb_via_playwright(user_data, browser_name, emit):
         return None
 
     channel = _PLAYWRIGHT_CHANNEL.get(browser_name)
-    emit(f"    Launching Playwright ({channel or 'bundled'}) to capture IndexedDB...")
+    label = channel or "bundled"
+    emit(f"    Extracting IndexedDB via {label} ...")
+
+    # Spinner — Chromium launch takes 30-90s with no output, so a rotating
+    # animation on stderr lets the user know the PC isn't frozen.
+    import threading
+    done = threading.Event()
+    _spinner_chars = ["|", "/", "-", "\\"]
+
+    def _spinner():
+        i = 0
+        while not done.is_set():
+            sys.stderr.write(f"\r      ... {_spinner_chars[i % 4]} ")
+            sys.stderr.flush()
+            i += 1
+            done.wait(0.3)
+        sys.stderr.write("\r" + " " * 20 + "\r")
+        sys.stderr.flush()
+
+    t = threading.Thread(target=_spinner, daemon=True)
+    t.start()
 
     # Chrome/Edge flags that skip unnecessary startup work in headless mode.
     _FAST_FLAGS = [
@@ -1485,6 +1505,10 @@ def extract_indexeddb_via_playwright(user_data, browser_name, emit):
             state = context.storage_state(indexedDB=True)
             context.close()
 
+            # Stop spinner
+            done.set()
+            t.join(timeout=1)
+
             # Extract IndexedDB: per-origin database descriptors
             indexeddb = {}
             for origin_entry in (state.get("origins") or []):
@@ -1497,6 +1521,8 @@ def extract_indexeddb_via_playwright(user_data, browser_name, emit):
             return indexeddb if indexeddb else None
 
     except Exception as e:
+        done.set()
+        t.join(timeout=1)
         emit(f"    ! IndexedDB extraction failed: {e}")
         return None
 
